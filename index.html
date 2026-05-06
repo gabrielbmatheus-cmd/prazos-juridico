@@ -49,6 +49,33 @@ function fromMondayDate(val) {
   if (!val) return "";
   try { const d = JSON.parse(val); return d.date || ""; } catch { return val || ""; }
 }
+function parseDateBR(str) {
+  if (!str) return "";
+  str = str.trim();
+  const p = str.split("/");
+  if (p.length === 3) return `${p[2]}-${p[1].padStart(2,"0")}-${p[0].padStart(2,"0")}`;
+  return "";
+}
+function parseCSV(text) {
+  const lines = text.split(/\r?\n/).filter(l => l.trim());
+  if (lines.length < 2) return [];
+  const sep = lines[0].includes(";") ? ";" : ",";
+  const headers = lines[0].split(sep).map(h => h.trim().replace(/^"|"$/g,"").toLowerCase());
+  const idIdx = headers.findIndex(h => h === "id");
+  const piIdx = headers.findIndex(h => h.includes("prazo interno"));
+  const peIdx = headers.findIndex(h => h.includes("prazo externo"));
+  const obsIdx = headers.findIndex(h => h === "obs");
+  const obs2Idx = headers.findIndex(h => h.includes("observa") && h.includes("resolu"));
+  if (idIdx === -1 || piIdx === -1 || peIdx === -1) return null;
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cols = lines[i].split(sep).map(c => c.trim().replace(/^"|"$/g,""));
+    const id = cols[idIdx], pi = parseDateBR(cols[piIdx]), pe = parseDateBR(cols[peIdx]);
+    if (!id || !pi || !pe) continue;
+    rows.push({ id: String(id), pi, pe, obs: obsIdx >= 0 ? cols[obsIdx]||"" : "", obs2: obs2Idx >= 0 ? cols[obs2Idx]||"" : "" });
+  }
+  return rows;
+}
 
 async function mondayQuery(apiKey, query, variables = {}) {
   const res = await fetch("/api/monday", {
@@ -67,14 +94,10 @@ async function getOrCreateBoard(apiKey) {
   if (existing) return existing.id;
   const created = await mondayQuery(apiKey, `mutation { create_board(board_name: "${BOARD_NAME}", board_kind: public) { id } }`);
   const boardId = created.create_board.id;
-  const cols = [
-    { title:"Categoria", type:"text" },
-    { title:"Prazo Interno", type:"date" },
-    { title:"Prazo Externo", type:"date" },
-    { title:"Observações", type:"text" },
-    { title:"ID Externo", type:"text" },
-  ];
-  for (const col of cols) {
+  for (const col of [
+    {title:"Categoria",type:"text"},{title:"Prazo Interno",type:"date"},
+    {title:"Prazo Externo",type:"date"},{title:"Observações",type:"text"},{title:"ID Externo",type:"text"},
+  ]) {
     await mondayQuery(apiKey, `mutation { create_column(board_id: ${boardId}, title: "${col.title}", column_type: ${col.type}) { id } }`);
   }
   return boardId;
@@ -84,68 +107,67 @@ async function fetchItems(apiKey, boardId) {
   const data = await mondayQuery(apiKey, `
     query {
       boards(ids: [${boardId}]) {
+        columns { id title }
         items_page(limit: 200) {
           items { id name column_values { id text value } }
         }
       }
     }
   `);
-  const items = data.boards[0]?.items_page?.items || [];
+  const board = data.boards[0];
+  const cols = board?.columns || [];
+  const items = board?.items_page?.items || [];
+
+  const findColId = (keyword) => cols.find(c => c.title.toLowerCase().includes(keyword.toLowerCase()))?.id;
+  const piId = findColId("prazo interno");
+  const peId = findColId("prazo externo");
+  const catId = findColId("categoria");
+  const obsId = findColId("observa");
+  const extId = findColId("id externo");
+
   return items.map(item => {
-    const getByTitle = (title) => item.column_values.find(c => c.id.toLowerCase().replace(/_/g," ").includes(title.toLowerCase()));
-    const piCol = getByTitle("prazo interno");
-    const peCol = getByTitle("prazo externo");
-    const catCol = getByTitle("categoria");
-    const obsCol = getByTitle("observa");
-    const extCol = getByTitle("id externo");
+    const cv = (id) => id ? item.column_values.find(c => c.id === id) : null;
     const statusCol = item.column_values.find(c => c.id === "status");
     return {
       id: item.id, mondayId: item.id, titulo: item.name,
-      categoria: catCol?.text || "Outro",
-      status: mondayStatusReverse[statusCol?.text?.toLowerCase()?.replace(" ","_")] || statusCol?.text || "Em andamento",
-      prazoInterno: fromMondayDate(piCol?.value) || piCol?.text || "",
-      prazoExterno: fromMondayDate(peCol?.value) || peCol?.text || "",
-      obs: obsCol?.text || "",
-      externalId: extCol?.text || "",
+      categoria: cv(catId)?.text || "Outro",
+      status: mondayStatusReverse[statusCol?.text?.toLowerCase()?.replace(/ /g,"_")] || "Em andamento",
+      prazoInterno: fromMondayDate(cv(piId)?.value) || "",
+      prazoExterno: fromMondayDate(cv(peId)?.value) || "",
+      obs: cv(obsId)?.text || "",
+      externalId: cv(extId)?.text || "",
+      _colIds: { piId, peId, catId, obsId, extId }
     };
   });
 }
 
-async function createItem(apiKey, boardId, item) {
-  const created = await mondayQuery(apiKey, `
-    mutation($name: String!, $vals: JSON!) {
-      create_item(board_id: ${boardId}, item_name: $name, column_values: $vals) { id }
-    }
-  `, {
-    name: item.titulo,
-    vals: JSON.stringify({
-      "categoria": item.categoria,
-      "prazo_interno": item.prazoInterno ? { date: item.prazoInterno } : null,
-      "prazo_externo": item.prazoExterno ? { date: item.prazoExterno } : null,
-      "observa__es": item.obs,
-      "id_externo": item.externalId || "",
-      "status": { label: item.status }
-    })
-  });
+async function getBoardColIds(apiKey, boardId) {
+  const data = await mondayQuery(apiKey, `query { boards(ids:[${boardId}]) { columns { id title } } }`);
+  const cols = data.boards[0]?.columns || [];
+  const find = (kw) => cols.find(c => c.title.toLowerCase().includes(kw.toLowerCase()))?.id;
+  return { piId: find("prazo interno"), peId: find("prazo externo"), catId: find("categoria"), obsId: find("observa"), extId: find("id externo") };
+}
+
+async function createItem(apiKey, boardId, item, colIds) {
+  const vals = {};
+  if (colIds.catId) vals[colIds.catId] = item.categoria;
+  if (colIds.piId && item.prazoInterno) vals[colIds.piId] = { date: item.prazoInterno };
+  if (colIds.peId && item.prazoExterno) vals[colIds.peId] = { date: item.prazoExterno };
+  if (colIds.obsId) vals[colIds.obsId] = item.obs || "";
+  if (colIds.extId) vals[colIds.extId] = item.externalId || "";
+  vals["status"] = { label: item.status };
+  const created = await mondayQuery(apiKey, `mutation($name:String!,$vals:JSON!){ create_item(board_id:${boardId},item_name:$name,column_values:$vals){id} }`, { name: item.titulo, vals: JSON.stringify(vals) });
   return created.create_item.id;
 }
 
-async function updateItem(apiKey, boardId, mondayId, item) {
-  await mondayQuery(apiKey, `
-    mutation($id: ID!, $name: String!, $vals: JSON!) {
-      change_multiple_column_values(item_id: $id, board_id: ${boardId}, column_values: $vals) { id }
-      change_item_name(item_id: $id, board_id: ${boardId}, value: $name) { id }
-    }
-  `, {
-    id: mondayId, name: item.titulo,
-    vals: JSON.stringify({
-      "categoria": item.categoria,
-      "prazo_interno": item.prazoInterno ? { date: item.prazoInterno } : null,
-      "prazo_externo": item.prazoExterno ? { date: item.prazoExterno } : null,
-      "observa__es": item.obs,
-      "status": { label: item.status }
-    })
-  });
+async function updateItem(apiKey, boardId, mondayId, item, colIds) {
+  const vals = {};
+  if (colIds.catId) vals[colIds.catId] = item.categoria;
+  if (colIds.piId && item.prazoInterno) vals[colIds.piId] = { date: item.prazoInterno };
+  if (colIds.peId && item.prazoExterno) vals[colIds.peId] = { date: item.prazoExterno };
+  if (colIds.obsId) vals[colIds.obsId] = item.obs || "";
+  vals["status"] = { label: item.status };
+  await mondayQuery(apiKey, `mutation($id:ID!,$name:String!,$vals:JSON!){ change_multiple_column_values(item_id:$id,board_id:${boardId},column_values:$vals){id} change_item_name(item_id:$id,board_id:${boardId},value:$name){id} }`, { id: mondayId, name: item.titulo, vals: JSON.stringify(vals) });
 }
 
 async function deleteItem(apiKey, mondayId) {
@@ -182,6 +204,7 @@ function App() {
   const [apiKey, setApiKey] = useState("");
   const [apiInput, setApiInput] = useState("");
   const [boardId, setBoardId] = useState(null);
+  const [colIds, setColIds] = useState({});
   const [connecting, setConnecting] = useState(false);
   const [connError, setConnError] = useState("");
   const [aba, setAba] = useState("solicitacoes");
@@ -189,6 +212,8 @@ function App() {
   const [semanais, setSemanais] = useState([]);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [importResult, setImportResult] = useState(null);
+  const [importando, setImportando] = useState(false);
   const [modalSol, setModalSol] = useState(false);
   const [modalSeman, setModalSeman] = useState(false);
   const [editSol, setEditSol] = useState(null);
@@ -198,11 +223,12 @@ function App() {
   const [filtroStatus, setFiltroStatus] = useState("Todos");
   const [filtroCat, setFiltroCat] = useState("Todas");
   const [confirmDel, setConfirmDel] = useState(null);
+  const fileRef = useRef();
 
   useEffect(() => {
     const k = localStorage.getItem("monday_key");
     const bid = localStorage.getItem("monday_board");
-    if (k) { setApiKey(k); if (bid) { setBoardId(bid); loadItems(k, bid); } else { loadBoard(k); } }
+    if (k) { setApiKey(k); if (bid) { setBoardId(bid); loadAll(k, bid); } else loadBoard(k); }
     try { const s = localStorage.getItem("seman_v1"); if (s) setSemanais(JSON.parse(s)); } catch {}
   }, []);
 
@@ -210,15 +236,21 @@ function App() {
     setLoading(true); setConnError("");
     try {
       const bid = await getOrCreateBoard(key);
-      setBoardId(bid); localStorage.setItem("monday_board", bid);
-      await loadItems(key, bid);
-    } catch(e) { setConnError("Erro ao conectar: " + e.message); }
+      const cids = await getBoardColIds(key, bid);
+      setBoardId(bid); setColIds(cids);
+      localStorage.setItem("monday_board", bid);
+      setSolicitacoes(await fetchItems(key, bid));
+    } catch(e) { setConnError("Erro: " + e.message); }
     setLoading(false);
   };
 
-  const loadItems = async (key, bid) => {
+  const loadAll = async (key, bid) => {
     setLoading(true);
-    try { setSolicitacoes(await fetchItems(key, bid)); } catch(e) { console.error(e); }
+    try {
+      const cids = await getBoardColIds(key, bid);
+      setColIds(cids);
+      setSolicitacoes(await fetchItems(key, bid));
+    } catch(e) { console.error(e); }
     setLoading(false);
   };
 
@@ -227,7 +259,8 @@ function App() {
     setConnecting(true); setConnError("");
     try {
       const bid = await getOrCreateBoard(apiInput.trim());
-      setBoardId(bid);
+      const cids = await getBoardColIds(apiInput.trim(), bid);
+      setBoardId(bid); setColIds(cids);
       setSolicitacoes(await fetchItems(apiInput.trim(), bid));
       setApiKey(apiInput.trim());
       localStorage.setItem("monday_key", apiInput.trim());
@@ -241,7 +274,38 @@ function App() {
     setApiKey(""); setBoardId(null); setSolicitacoes([]);
   };
 
-  const saveSeman = (data) => { setSemanais(data); localStorage.setItem("seman_v1", JSON.stringify(data)); };
+  const handleCSV = (e) => {
+    const file = e.target.files[0]; if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async (ev) => {
+      const rows = parseCSV(ev.target.result);
+      if (!rows) { setImportResult({ erro:true, msg:"Colunas não encontradas. Verifique se o arquivo tem ID, Prazo Interno e Prazo Externo." }); return; }
+      if (rows.length === 0) { setImportResult({ erro:true, msg:"Nenhuma linha válida encontrada." }); return; }
+      setImportando(true);
+      let adicionados = 0, atualizados = 0;
+      const atuais = [...solicitacoes];
+      for (const row of rows) {
+        const idx = atuais.findIndex(s => s.externalId === row.id);
+        const titulo = row.obs || `Chamado #${row.id}`;
+        const item = { titulo, categoria:"Outro", status:"Em andamento", prazoInterno:row.pi, prazoExterno:row.pe, obs:row.obs2, externalId:row.id };
+        try {
+          if (idx >= 0) {
+            const updated = { ...atuais[idx], prazoInterno:row.pi, prazoExterno:row.pe, titulo, obs:row.obs2 };
+            await updateItem(apiKey, boardId, atuais[idx].mondayId, updated, colIds);
+            atuais[idx] = updated; atualizados++;
+          } else {
+            const newId = await createItem(apiKey, boardId, item, colIds);
+            atuais.push({ ...item, mondayId:newId, id:newId }); adicionados++;
+          }
+        } catch(err) { console.error("Erro ao importar linha:", err); }
+      }
+      setSolicitacoes(atuais);
+      setImportResult({ erro:false, adicionados, atualizados, total:rows.length });
+      setImportando(false);
+    };
+    reader.readAsText(file, "windows-1252");
+    e.target.value = "";
+  };
 
   const openNewSol = () => { setEditSol(null); setFormSol(emptyForm); setModalSol(true); };
   const openEditSol = (s) => { setEditSol(s); setFormSol({...s}); setModalSol(true); };
@@ -250,11 +314,11 @@ function App() {
     setSaving(true);
     try {
       if (editSol?.mondayId) {
-        await updateItem(apiKey, boardId, editSol.mondayId, formSol);
-        setSolicitacoes(prev => prev.map(s => s.mondayId === editSol.mondayId ? { ...formSol, mondayId: editSol.mondayId, id: editSol.id } : s));
+        await updateItem(apiKey, boardId, editSol.mondayId, formSol, colIds);
+        setSolicitacoes(prev => prev.map(s => s.mondayId===editSol.mondayId ? {...formSol,mondayId:editSol.mondayId,id:editSol.id} : s));
       } else {
-        const newId = await createItem(apiKey, boardId, formSol);
-        setSolicitacoes(prev => [...prev, { ...formSol, mondayId: newId, id: newId }]);
+        const newId = await createItem(apiKey, boardId, formSol, colIds);
+        setSolicitacoes(prev => [...prev, {...formSol,mondayId:newId,id:newId}]);
       }
       setModalSol(false);
     } catch(e) { alert("Erro ao salvar: " + e.message); }
@@ -262,34 +326,34 @@ function App() {
   };
   const deleteSol = async (s) => {
     setSaving(true);
-    try { await deleteItem(apiKey, s.mondayId); setSolicitacoes(prev => prev.filter(x => x.mondayId !== s.mondayId)); }
-    catch(e) { alert("Erro ao excluir: " + e.message); }
+    try { await deleteItem(apiKey, s.mondayId); setSolicitacoes(prev => prev.filter(x => x.mondayId!==s.mondayId)); }
+    catch(e) { alert("Erro: " + e.message); }
     setSaving(false); setConfirmDel(null);
   };
   const changeStatusSol = async (s, status) => {
-    setSolicitacoes(prev => prev.map(x => x.mondayId === s.mondayId ? { ...x, status } : x));
-    try { await updateItem(apiKey, boardId, s.mondayId, { ...s, status }); } catch {}
+    setSolicitacoes(prev => prev.map(x => x.mondayId===s.mondayId ? {...x,status} : x));
+    try { await updateItem(apiKey, boardId, s.mondayId, {...s,status}, colIds); } catch {}
   };
 
+  const saveSeman = (data) => { setSemanais(data); localStorage.setItem("seman_v1", JSON.stringify(data)); };
   const openNewSeman = () => { setEditSeman(null); setFormSeman(emptySemanForm); setModalSeman(true); };
-  const openEditSeman = (t) => { setEditSeman(t.id); setFormSeman({ titulo: t.titulo, dia: t.dia }); setModalSeman(true); };
+  const openEditSeman = (t) => { setEditSeman(t.id); setFormSeman({titulo:t.titulo,dia:t.dia}); setModalSeman(true); };
   const submitSeman = () => {
     if (!formSeman.titulo.trim()) return;
-    const updated = editSeman ? semanais.map(t => t.id === editSeman ? { ...t, ...formSeman } : t) : [...semanais, { ...formSeman, id: Date.now(), feito: false }];
+    const updated = editSeman ? semanais.map(t => t.id===editSeman ? {...t,...formSeman} : t) : [...semanais, {...formSeman,id:Date.now(),feito:false}];
     saveSeman(updated); setModalSeman(false);
   };
-  const toggleSeman = (id) => saveSeman(semanais.map(t => t.id === id ? { ...t, feito: !t.feito } : t));
-  const deleteSeman = (id) => { saveSeman(semanais.filter(t => t.id !== id)); setConfirmDel(null); };
-  const resetSemana = () => saveSeman(semanais.map(t => ({ ...t, feito: false })));
+  const toggleSeman = (id) => saveSeman(semanais.map(t => t.id===id ? {...t,feito:!t.feito} : t));
+  const deleteSeman = (id) => { saveSeman(semanais.filter(t => t.id!==id)); setConfirmDel(null); };
+  const resetSemana = () => saveSeman(semanais.map(t => ({...t,feito:false})));
 
   const criticos = solicitacoes.filter(isCritico);
   const solFiltradas = solicitacoes.filter(s =>
-    (filtroStatus === "Todos" || s.status === filtroStatus) &&
-    (filtroCat === "Todas" || s.categoria === filtroCat)
-  ).sort((a,b) => new Date(a.prazoInterno) - new Date(b.prazoInterno));
+    (filtroStatus==="Todos"||s.status===filtroStatus) && (filtroCat==="Todas"||s.categoria===filtroCat)
+  ).sort((a,b) => new Date(a.prazoInterno)-new Date(b.prazoInterno));
 
   if (!apiKey) return (
-    <div style={{display:"flex",alignItems:"center",justifyContent:"center",minHeight:"100vh",background:"#F8FAFC",fontFamily:"Inter,sans-serif",padding:"24px"}}>
+    <div style={{display:"flex",alignItems:"center",justifyContent:"center",minHeight:"100vh",background:"#F8FAFC",padding:"24px"}}>
       <div style={{background:"#fff",borderRadius:"16px",padding:"36px",maxWidth:"440px",width:"100%",boxShadow:"0 4px 24px rgba(0,0,0,.08)"}}>
         <div style={{width:"48px",height:"48px",background:"#EFF6FF",borderRadius:"12px",display:"flex",alignItems:"center",justifyContent:"center",marginBottom:"20px",fontSize:"24px"}}>⚖️</div>
         <h1 style={{fontSize:"20px",fontWeight:700,margin:"0 0 6px",color:"#0F172A"}}>Jurídico – Gestão de Prazos</h1>
@@ -313,9 +377,9 @@ function App() {
           <h1 style={{fontSize:"22px",fontWeight:700,margin:0,color:"#0F172A"}}>Jurídico – Gestão de Prazos</h1>
           <p style={{color:"#64748B",fontSize:"13px",margin:"4px 0 0"}}>{today.toLocaleDateString("pt-BR",{weekday:"long",day:"numeric",month:"long",year:"numeric"})}</p>
         </div>
-        <div style={{display:"flex",gap:"8px",alignItems:"center"}}>
+        <div style={{display:"flex",gap:"8px",alignItems:"center",flexWrap:"wrap"}}>
           <span style={{fontSize:"11px",background:"#F0FDF4",color:"#15803D",padding:"4px 10px",borderRadius:"20px",fontWeight:600,border:"1px solid #BBF7D0"}}>● Monday conectado</span>
-          <button onClick={()=>loadItems(apiKey,boardId)} disabled={loading} style={{background:"#F1F5F9",border:"none",borderRadius:"8px",padding:"7px 12px",fontSize:"12px",cursor:"pointer",color:"#475569"}}>{loading?"...":"↻ Atualizar"}</button>
+          <button onClick={()=>loadAll(apiKey,boardId)} disabled={loading} style={{background:"#F1F5F9",border:"none",borderRadius:"8px",padding:"7px 12px",fontSize:"12px",cursor:"pointer",color:"#475569"}}>{loading?"...":"↻ Atualizar"}</button>
           <button onClick={disconnect} style={{background:"#FEF2F2",border:"none",borderRadius:"8px",padding:"7px 12px",fontSize:"12px",cursor:"pointer",color:"#EF4444"}}>Desconectar</button>
         </div>
       </div>
@@ -341,6 +405,25 @@ function App() {
 
       {aba==="solicitacoes"&&(
         <div>
+          {/* Importação CSV */}
+          <div style={{background:"#F1F5F9",borderRadius:"10px",padding:"12px 16px",marginBottom:"16px",display:"flex",alignItems:"center",gap:"12px",flexWrap:"wrap"}}>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{fontSize:"13px",fontWeight:600,color:"#334155"}}>Importar via planilha</div>
+              <div style={{fontSize:"12px",color:"#64748B",marginTop:"2px"}}>Exporte como CSV (MS-DOS) e importe aqui. Os dados são sincronizados direto no Monday.</div>
+            </div>
+            <input type="file" accept=".csv" ref={fileRef} onChange={handleCSV} style={{display:"none"}} />
+            <button onClick={()=>fileRef.current.click()} disabled={importando} style={{background:"#1D4ED8",color:"#fff",border:"none",borderRadius:"8px",padding:"9px 16px",fontSize:"13px",cursor:"pointer",fontWeight:600,whiteSpace:"nowrap",flexShrink:0,opacity:importando?0.7:1}}>
+              {importando?"Importando...":"↑ Importar CSV"}
+            </button>
+          </div>
+
+          {importResult&&(
+            <div style={{background:importResult.erro?"#FEF2F2":"#F0FDF4",border:`1px solid ${importResult.erro?"#FECACA":"#BBF7D0"}`,borderRadius:"8px",padding:"10px 14px",marginBottom:"16px",fontSize:"13px",color:importResult.erro?"#DC2626":"#15803D",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <span>{importResult.erro?`Erro: ${importResult.msg}`:`Importação concluída – ${importResult.adicionados} adicionados, ${importResult.atualizados} atualizados (${importResult.total} linhas)`}</span>
+              <button onClick={()=>setImportResult(null)} style={{background:"none",border:"none",cursor:"pointer",color:"inherit",fontSize:"16px",padding:"0 4px"}}>×</button>
+            </div>
+          )}
+
           <div style={{display:"flex",gap:"8px",marginBottom:"16px",flexWrap:"wrap",alignItems:"center"}}>
             <select value={filtroStatus} onChange={e=>setFiltroStatus(e.target.value)} style={{...inp,width:"auto",flex:"1 1 140px"}}>
               <option value="Todos">Todos os status</option>
@@ -352,8 +435,10 @@ function App() {
             </select>
             <button onClick={openNewSol} style={{background:"#1D4ED8",color:"#fff",border:"none",borderRadius:"8px",padding:"9px 18px",fontSize:"13px",cursor:"pointer",fontWeight:600,whiteSpace:"nowrap"}}>+ Nova solicitação</button>
           </div>
+
           {loading&&<div style={{textAlign:"center",color:"#94A3B8",padding:"48px 0"}}>Carregando do Monday...</div>}
           {!loading&&solFiltradas.length===0&&<div style={{textAlign:"center",color:"#94A3B8",padding:"64px 0",fontSize:"14px"}}>Nenhuma solicitação encontrada.</div>}
+
           <div style={{display:"flex",flexDirection:"column",gap:"10px"}}>
             {solFiltradas.map(s=>{
               const pi=prazoStatus(s.prazoInterno),pe=prazoStatus(s.prazoExterno),crit=isCritico(s);
